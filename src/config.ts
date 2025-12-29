@@ -44,4 +44,8 @@ export const TRACKED_TOKENS = [
     },
 ];
 
+
 export const UNI_COINGECKO_ID = 'uniswap';
+
+export const ALCHEMY_API_KEY = import.meta.env.VITE_ALCHEMY_API_KEY;
+export const ALCHEMY_RPC_URL = `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}`;
