@@ -1,7 +1,7 @@
 import { useReadContracts } from 'wagmi';
 import { formatUnits } from 'viem';
 import { useQuery } from '@tanstack/react-query';
-import { ERC20_ABI, TOKEN_JAR_ADDRESS, TRACKED_TOKENS, UNI_COINGECKO_ID, ALCHEMY_RPC_URL } from '../config';
+import { ERC20_ABI, TOKEN_JAR_ADDRESS, ALCHEMY_RPC_URL } from '../config';
 
 // Alchemy Response Types
 interface AlchemyTokenBalance {
@@ -15,47 +15,93 @@ interface AlchemyResponse {
     result: {
         address: string;
         tokenBalances: AlchemyTokenBalance[];
+        pageKey?: string; // Added pageKey for pagination
     };
 }
 
-// Helper to fetch balances from Alchemy
+// Helper to fetch balances from Alchemy with pagination
 const fetchAlchemyBalances = async () => {
     if (!ALCHEMY_RPC_URL) throw new Error("Missing Alchemy RPC URL");
 
-    const response = await fetch(ALCHEMY_RPC_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            jsonrpc: "2.0",
-            method: "alchemy_getTokenBalances",
+    let allBalances: AlchemyTokenBalance[] = [];
+    let pageKey: string | undefined = undefined;
+
+    do {
+        const response: Response = await fetch(ALCHEMY_RPC_URL, {
+            method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            params: [
-                TOKEN_JAR_ADDRESS,
-                "erc20",
-            ],
-            id: 42
-        }),
-    });
+            body: JSON.stringify({
+                jsonrpc: "2.0",
+                method: "alchemy_getTokenBalances",
+                headers: { 'Content-Type': 'application/json' },
+                params: [
+                    TOKEN_JAR_ADDRESS,
+                    "erc20",
+                    pageKey ? { pageKey } : {}
+                ],
+                id: 42
+            }),
+        });
 
-    if (!response.ok) {
-        throw new Error('Failed to fetch from Alchemy');
-    }
+        if (!response.ok) {
+            throw new Error('Failed to fetch from Alchemy');
+        }
 
-    const data: AlchemyResponse = await response.json();
-    return data.result.tokenBalances.filter(t =>
-        // Filter out zero balances and very small dust (at least some hex value)
+        const data: AlchemyResponse = await response.json();
+        const result = data.result;
+
+        if (result.tokenBalances) {
+            allBalances = [...allBalances, ...result.tokenBalances];
+        }
+
+        pageKey = result.pageKey;
+
+    } while (pageKey);
+
+    return allBalances.filter(t =>
+        // Filter out zero balances and very small dust
         t.tokenBalance !== "0x0000000000000000000000000000000000000000000000000000000000000000"
     );
 };
 
-// Helper to fetch prices from CoinGecko
-const fetchPrices = async (ids: string) => {
-    if (!ids) return {};
-    const response = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd`);
-    if (!response.ok) {
-        throw new Error('Failed to fetch prices');
+// Helper to fetch prices from DEXScreener (Batched)
+// DEXScreener is better for long-tail/meme tokens than CoinGecko or Chainlink
+const fetchPrices = async (addresses: string[]) => {
+    if (!addresses.length) return {};
+
+    // Chunking: DEXScreener allows ~30 addresses per call
+    const CHUNK_SIZE = 30;
+    const chunks = [];
+    for (let i = 0; i < addresses.length; i += CHUNK_SIZE) {
+        chunks.push(addresses.slice(i, i + CHUNK_SIZE));
     }
-    return response.json();
+
+    const results = await Promise.all(chunks.map(async (chunk) => {
+        const ids = chunk.join(',');
+        const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${ids}`);
+        if (!response.ok) {
+            console.error('Failed to fetch prices for chunk', chunk);
+            return {};
+        }
+        const data = await response.json();
+        const pairs = data.pairs || [];
+
+        // Map address -> price
+        const priceMap: Record<string, number> = {};
+        pairs.forEach((pair: any) => {
+            const addr = pair.baseToken.address.toLowerCase();
+            const price = parseFloat(pair.priceUsd);
+            // If we already have a price, we might want to keep the one with higher liquidity, 
+            // but DEXScreener often returns best pair first.
+            if (!priceMap[addr]) {
+                priceMap[addr] = price;
+            }
+        });
+        return priceMap;
+    }));
+
+    // Merge all results
+    return results.reduce((acc, curr) => ({ ...acc, ...curr }), {});
 };
 
 export function useArbitrageData() {
@@ -66,17 +112,12 @@ export function useArbitrageData() {
         refetchInterval: 60000
     });
 
-    // 2. Identify tokens that need metadata (not in our hardcoded known list)
-    const knownTokenMap = new Map(TRACKED_TOKENS.map(t => [t.address.toLowerCase(), t]));
-
-    // List of addresses found by Alchemy
+    // 2. Identify tokens that need metadata
+    // We treat all tokens as "Unknown" to ensure we fetch metadata for everything dynamically
     const foundTokenAddresses = alchemyBalances?.map(b => b.contractAddress.toLowerCase()) || [];
 
-    // Filter for ones we don't know
-    const unknownTokenAddresses = foundTokenAddresses.filter(addr => !knownTokenMap.has(addr));
-
-    // 3. Fetch Metadata for unknown tokens (Symbol, Decimals)
-    const metadataContracts = unknownTokenAddresses.flatMap(address => [
+    // 3. Fetch Metadata for ALL tokens (Symbol, Decimals)
+    const metadataContracts = foundTokenAddresses.flatMap(address => [
         {
             address: address as `0x${string}`,
             abi: ERC20_ABI,
@@ -92,71 +133,59 @@ export function useArbitrageData() {
     const { data: metadataResults, isLoading: isMetadataLoading } = useReadContracts({
         contracts: metadataContracts,
         query: {
-            enabled: unknownTokenAddresses.length > 0
+            enabled: foundTokenAddresses.length > 0
         }
     });
 
     // 4. Construct Full Token List with Metadata
-    // Combine Known + Fetched Metadata
     const unifiedTokens = alchemyBalances?.map(item => {
         const addr = item.contractAddress.toLowerCase();
         let symbol = '???';
         let decimals = 18;
-        let coingeckoId = ''; // We might not know the ID for random tokens, default to empty or generic fetch
 
-        // Case A: Known Token
-        if (knownTokenMap.has(addr)) {
-            const known = knownTokenMap.get(addr)!;
-            symbol = known.symbol;
-            decimals = 6; // Default fallback to 6? No, relying on known list defaults or hardcoded overrides in original code
-            // Actually, original code had a 'knownDecimals' map inside the loop. Let's try to preserve or improve that.
-            const knownDecimals: Record<string, number> = {
-                'USDC': 6, 'USDT': 6, 'WBTC': 8, 'WETH': 18, 'DAI': 18
-            };
-            decimals = knownDecimals[known.symbol] || 18;
-            coingeckoId = known.coingeckoId;
-        }
-        // Case B: Unknown Token (Recovered from metadata fetch)
-        else {
-            const index = unknownTokenAddresses.indexOf(addr);
-            if (index !== -1 && metadataResults) {
-                const symbolRes = metadataResults[index * 2];
-                const decimalsRes = metadataResults[index * 2 + 1];
+        const index = foundTokenAddresses.indexOf(addr);
+        if (index !== -1 && metadataResults) {
+            const symbolRes = metadataResults[index * 2];
+            const decimalsRes = metadataResults[index * 2 + 1];
 
-                if (symbolRes.status === 'success') symbol = symbolRes.result as string;
-                if (decimalsRes.status === 'success') decimals = decimalsRes.result as number;
-            }
-            // For unknown tokens, we can't easily guess CoinGecko ID without another API call or huge map.
-            // For now, we only fetch prices for KNOWN tokens.
+            if (symbolRes.status === 'success') symbol = symbolRes.result as string;
+            if (decimalsRes.status === 'success') decimals = decimalsRes.result as number;
         }
 
         return {
-            address: item.contractAddress, // Keep original casing or normalize? Let's use what Alchemy gave or normalize.
+            address: item.contractAddress,
             rawBalance: BigInt(item.tokenBalance),
             symbol,
-            decimals,
-            coingeckoId
+            decimals
         };
     }) || [];
 
-    // 5. Fetch Prices
-    // We only fetch prices for tokens where we have a coingeckoID
-    const priceIds = [UNI_COINGECKO_ID, ...unifiedTokens.filter(t => t.coingeckoId).map(t => t.coingeckoId)];
-    const uniqueIds = [...new Set(priceIds)].join(',');
+    // Filter out ignored tokens (e.g. UNI-V2 LP tokens)
+    const filteredTokens = unifiedTokens.filter(t => t.symbol?.toUpperCase() !== 'UNI-V2');
+
+    // 5. Fetch Prices via DEXScreener
+    // We fetch for ALL filtered tokens + UNI price
+    const tokenAddressesToFetch = filteredTokens.map(t => t.address);
+    const uniAddress = '0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984';
+    const allAddresses = [...tokenAddressesToFetch, uniAddress];
+
+    // Create a key for query cache that is stable but unique enough
+    const queryKey = allAddresses.join(',');
 
     const { data: priceData, isLoading: pricesLoading } = useQuery({
-        queryKey: ['coingeckoPrices', uniqueIds],
-        queryFn: () => fetchPrices(uniqueIds),
-        enabled: uniqueIds.length > 0,
+        queryKey: ['dexScreenerPrices', queryKey],
+        queryFn: () => fetchPrices(allAddresses),
+        enabled: allAddresses.length > 0,
         refetchInterval: 60000
     });
 
-    const uniPrice = priceData?.[UNI_COINGECKO_ID]?.usd || 0;
+    const uniPrice = priceData?.[uniAddress.toLowerCase()] || 0;
 
     // 6. Calculate Finals
-    const formattedData = unifiedTokens.map(token => {
+    const formattedData = filteredTokens.map(token => {
         const balance = parseFloat(formatUnits(token.rawBalance, token.decimals));
-        const price = token.coingeckoId ? (priceData?.[token.coingeckoId]?.usd || 0) : 0;
+        // DEXScreener returns keys in lowercase
+        const price = priceData?.[token.address.toLowerCase()] || 0;
         const value = balance * price;
 
         return {
